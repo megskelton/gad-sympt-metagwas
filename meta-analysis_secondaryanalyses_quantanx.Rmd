@@ -1,0 +1,588 @@
+---
+title: "Quantitative anxiety symptom genome-wide meta-analysis"
+author: "Megan Skelton"
+output: html_document
+---
+
+Analysis was run on the KCL CREATE HPC: King's College London. (2022). King's Computational Research, Engineering and Technology Environment (CREATE). Retrieved March 2, 2022, from https://doi.org/10.18742/rnvf-m076
+
+# Meta-analysis
+```{bash METAL script}
+
+echo '
+COLUMNCOUNTING   STRICT
+SCHEME           STDERR
+AVERAGEFREQ      ON
+MINMAXFREQ       ON
+CUSTOMVARIABLE   N
+GENOMICCONTROL   OFF
+OVERLAP	    OFF
+ADDFILTER EAF > 0.01
+ADDFILTER INFO > 0.6
+
+MARKERLABEL      MARKER
+ALLELELABELS     EA NEA           
+EFFECTLABEL      BETA
+PVALUELABEL      P
+STDERR           SE
+FREQLABEL        EAF
+WEIGHTLABEL      N
+
+PROCESSFILE /qcd_cohort_sumstats/AGDS_all.QCed
+PROCESSFILE /qcd_cohort_sumstats/ALSPAC_GAD7_1209_Final.QCed
+PROCESSFILE /qcd_cohort_sumstats/EstBB_ESTQ2_1209_Final.QCed
+PROCESSFILE /qcd_cohort_sumstats/GenScot_GHQ_ANX_1209_Final.QCed
+PROCESSFILE /qcd_cohort_sumstats/GLAD_UKB_NBR_1209_Final.QCed
+PROCESSFILE /qcd_cohort_sumstats/TEDS_GAD10_1209_Final.QCed
+PROCESSFILE /qcd_cohort_sumstats/PsyCoLaus_STAI_STATE_Final.QCed
+PROCESSFILE /qcd_cohort_sumstats/MOBA_GAD7_1209_Final.QCed
+PROCESSFILE /qcd_cohort_sumstats/MEGA_STAI_TRAIT_1209_Final.QCed
+PROCESSFILE /qcd_cohort_sumstats/MVP_GAD2_1209_Final.QCed
+PROCESSFILE /qcd_cohort_sumstats/PROTECTAD_140624_GAD7_noX.QCed
+PROCESSFILE /qcd_cohort_sumstats/lifelines_GSA_GAD_1209_Final.QCed
+PROCESSFILE /qcd_cohort_sumstats/lifelines_CYTO_GAD_1209_Final.QCed
+PROCESSFILE /qcd_cohort_sumstats/lifelines_AFFY_GAD_1209_Final.QCed
+PROCESSFILE /qcd_cohort_sumstats/TRAILS_allchr.QCed
+
+OUTFILE quantanx_metaanalysis .tbl
+ANALYZE HETEROGENEITY
+VERBOSE ON 
+QUIT
+' > gadsympt_METAL.txt
+module load metal/2020-05-05-gcc-13.2.0
+metal gadsympt_METAL.txt
+
+```
+
+## Post-MA QC
+Add SNP (rsID) to output by merging with reference panel e.g. HRC, joining on Marker (CHR:POS), and add CHR BP or split Marker for separate columns.
+Restrict to SNPs >50% cohorts contributed to and with EAF 0.01 < Freq1 < 0.99. 
+Select required columns and rename. Order by CHR:POS.
+```{bash}
+
+# check where CHR, BP, SNP are in your REF file, and where MARKERID is that you're merging on - here it was $1 
+awk -F'\t' -v OFS='\t' 'NR==FNR {
+    CHR[$1] = $18
+    BP[$1]  = $19
+    SNP[$1] = $17
+    next
+}
+FNR==1 {
+    print $0, "CHR", "BP", "SNP"
+    next
+}
+{
+    print $0, CHR[$1], BP[$1], SNP[$1]
+}' \
+    <(gunzip -c ref_file_with_CHR_BP_SNP) \
+    <(gunzip -c quantanx_metaanalysis.gz) | gzip \
+    > quantanx_metaanalysis_rsid.gz
+
+
+gunzip -c quantanx_metaanalysis_rsid.gz \
+| awk '
+NR==1 { print; next }
+
+{
+    chr = $17 #assuming chr is column 17
+    n_contrib = $14+1 # assuming HetDf (N cohorts - 1) is column 14, add 1 for N contributing cohorts
+
+    if ((chr == 23 && n_contrib >= 4) || (chr != 23 && n_contrib >= 8)) { #different thresholds as subset provided x-chr data
+        print
+    }
+}
+' | gzip > quantanx_metaanalysis_filtered.gz
+
+# Select the required cols
+zcat quantanx_metaanalysis_filtered.gz | awk 'NR==1 {print "SNP", "MARKERID", "CHR", "BP", "A1", "A2", "FREQ", "BETA", "SE", "P", "N"; next}
+{print $19, $1, $17, $18, $2, $3, $4, $8, $9, $10, $16}
+' | sort -k3,3n -k4,4n | gzip > pgc-anx2-gadsymptsquant-2026_eur.txt.gz
+
+```
+
+# LDSC SNP h2
+```{bash}
+
+/ldsc/munge_sumstats.py \
+--chunksize 50000 \
+--snp SNP \
+--sumstats /metaanalysis_sumstats/quantanx_metaanalysis_filtered.gz \
+--out /munged/quantanx_metaanalysis \
+--merge-alleles /ldsc/w_hm3.snplist
+
+/ldsc/ldsc.py \
+--h2 /munged/quantanx_metaanalysis.sumstats.gz \
+--ref-ld-chr /ldsc/eur_w_ld_chr/ \
+--w-ld-chr /ldsc/eur_w_ld_chr/ \
+--out /snph2/quantanx_metaanalysis_ldsc_h2
+
+```
+
+# Manhattan plot and QQ plot
+```{r}
+
+library(data.table)
+library(tidyverse)
+library(qqman)
+
+palette = c("#3d7667", "#abd4c9")
+
+results <- fread("pgc-anx2-gadsymptsquant-2026_eur.txt.gz", header=T)
+
+bitmap("quantanx_manhattan.png",
+type = "png16m", height = 10, width = 30, res = 600)
+
+par(cex.axis = 0.9, cex.lab = 1.3)
+manhattan(results, 
+chr="CHR", 
+bp="BP",
+p="P",
+snp="SNP",
+ylim = c(0, 16),
+col = palette,
+cex = 0.5,
+suggestiveline = F,
+genomewideline = -log10(5e-08))
+
+dev.off()
+
+bitmap("quantanx_qqplot.png", type = "png16m", 
+height = 10, width = 10, res = 600)
+
+par(mar=c(5,5,1,1))
+qq(results$P,
+cex.axis = 1.1,
+cex.lab = 1.3,
+xlim = c(0, 9),
+ylim = c(0, 15))
+
+dev.off()
+
+```
+
+# Significant loci
+Using the FUMA output (as performed 2 rounds of clumping) from the following parameters:
+r2 threshold 0.1 
+second r2 threshold 0.05
+LD blocks on locus 500kb
+1000G Phase3 EUR
+```{r}
+
+fuma_snps <- fread("../FUMA_job686083/IndSigSNPs.txt")
+
+loci_table <- fuma_snps %>%
+  select(Locus = GenomicLocus,
+         SNP = rsID,
+         CHR = chr,
+         BP = pos,
+         p,
+         NSigSNPs = nGWASSNPs)
+
+sumstats <- fread("pgc-anx2-gadsymptsquant-2026_eur.txt.gz")
+
+sumstats <- sumstats %>%
+  select(SNP, A1, A2, A1Freq = FREQ, Beta = BETA, SE, N)
+
+loci_table <- loci_table %>%
+  left_join(., sumstats, by = "SNP") %>% 
+  select(Locus, SNP, CHR, BP, A1, A2, A1Freq, Beta, SE, p, N, NSigSNPs)
+
+all_snps <- fread("../FUMA_job686083/snps.txt")
+
+all_snps_info <- all_snps %>%
+  select(SNP = rsID, CHR = chr, nearestGene, dist) %>%
+  left_join(loci_table, ., by = c("SNP", "CHR"))
+
+```
+
+# Novelty and replication
+## LDTrait 
+LDlink results using an r2 of 0.1 and a 500kb basepair window ref panel, saved in a txt file
+```{r load ldtrait results}
+
+ldtrait_quantanx <- fread("../ma_results/correction_aug25/ldlink_quantanx_r201_500kb_020925.txt")
+
+```
+
+### Internalising
+Identify SNPs identified in previous GWAS of internalising traits
+```{r identify replicated snps}
+
+snps_internalising <- ldtrait_quantanx %>% filter(
+  grepl("anx", `GWAS Trait`, ignore.case = T) | 
+  grepl("depr", `GWAS Trait`, ignore.case = T) &
+  !grepl("Bipolar disorder vs major depressive disorder \\(ordinary least squares \\(OLS\\)\\)", 
+           `GWAS Trait`, ignore.case = TRUE) | #ignore this label captured by depr but is a comparison of bipolar + depr
+  grepl("neuroti", `GWAS Trait`, ignore.case = T) |
+  grepl("mdd", `GWAS Trait`, ignore.case = T) |
+  grepl("worry", `GWAS Trait`, ignore.case = T) | 
+  grepl("well-being", `GWAS Trait`, ignore.case = T) | 
+  grepl("satisfaction", `GWAS Trait`, ignore.case = T) |
+  grepl("feeling", `GWAS Trait`, ignore.case = T) |  #captures Feeling miserable, Feeling tense, Feeling nervous, Feeling worry, Feeling fed-up, Feeling guilty - confirmed the few that appear for this latter also have other internalising associations
+  grepl("Post-traumatic stress", `GWAS Trait`, ignore.case = T) |
+  `GWAS Trait` == "Positive affect" |
+  `GWAS Trait` == "Suffering from nerves" | 
+  `GWAS Trait` == "Major mood disorders" | # only one for this and also appeared for other internalising traits e.g. worry, neuroticism, depression (if had only been mood would want to check this wasn't driven by bip/mania)
+  `GWAS Trait` == "Irritable mood" | # confirmed that all rsIDs for this also appeared for other internalising traits
+  `GWAS Trait` == "Neurociticism") # capture this trait label which has a typo
+
+nrow(snps_internalising)
+
+# list the snps from our sumstats (query) that had internalising hits
+snps_internalising_list <- snps_internalising %>%
+  distinct(Query) %>%
+  pull()
+
+# create a binary variable to flag if locus had an internalising hit
+loci_table <- loci_table %>%
+  mutate(
+    internalising_hit = if_else(SNP %in% snps_internalising_list, 1, 0)
+  )
+
+```
+
+### Anxiety
+```{r}
+
+snps_anx_list <- snps_internalising %>% 
+  filter(
+    grepl("anx", `GWAS Trait`, ignore.case = T)) %>% 
+  distinct(Query) %>%
+  pull()
+
+loci_table <- loci_table %>%
+  mutate(
+    anx_hit = if_else(SNP %in% snps_anx_list, 1, 0)
+  )
+
+loci_table_replications <- loci_table %>%
+  select(Locus, SNP, CHR, BP, internalising_hit, anx_hit)
+
+novel_snps <- setdiff(fuma_snps$rsID, snps_internalising$Query) # Novel = novel for internalising
+length(novel_snps)
+
+```
+
+## Bedtools
+Use FUMA to clump (same parameters as our sumstats) and bedtools to identify overlap with relevant sumstats not in GWAS Catalog
+
+Li et al. anxiety
+Friligkou et al. anxiety
+Strom et al. anxiety
+Adams et al. MDD
+
+```{bash create BED files for bedtools}
+
+for i in quantanx_GenomicRiskLoci.txt Stromanxiety_GenomicRiskLoci.txt Lianxiety_GenomicRiskLoci.txt Friligkouanxiety_GenomicRiskLoci.txt AdamsMDD23andme_GenomicRiskLoci.txt 
+do
+awk 'NR>1 {print "chr"$4, $7-1, $8, $1}' OFS='\t' "$i" > "${i}.BED"
+done
+
+module load bedtools2/2.31.0-gcc-12.3.0-python-3.11.6
+
+for i in Stromanxiety_GenomicRiskLoci.txt.BED Lianxiety_GenomicRiskLoci.txt.BED Friligkouanxiety_GenomicRiskLoci.txt.BED AdamsMDD23andme_GenomicRiskLoci.txt.BED
+do
+bedtools intersect -a quantanx_GenomicRiskLoci.txt.BED -b "$i" > "intersect_quantanx_${i}.BED"
+done
+
+```
+
+Merge individual results in R file
+```{r}
+
+library(data.table)
+library(tidyverse)
+
+quantanx_loci <- fread("quantanx_GenomicRiskLoci.txt", data.table = F)
+strom <- fread("intersect_quantanx_Stromanxiety_GenomicRiskLoci.txt.BED.BED", data.table = F)
+li <- fread("intersect_quantanx_Lianxiety_GenomicRiskLoci.txt.BED.BED", data.table = F)
+adams <- fread("intersect_quantanx_AdamsMDD23andme_GenomicRiskLoci.txt.BED.BED", data.table = F)
+friligkou <- fread("intersect_quantanx_Friligkouanxiety_GenomicRiskLoci.txt.BED.BED", data.table = F)
+
+quantanx_loci <- quantanx_loci %>%
+  select(GenomicLocus, chr, pos, start, end, rsID, IndSigSNPs, LeadSNPs) %>%
+  rename(locus = GenomicLocus)
+
+sumstat_names <- c("strom", "li", "friligkou", "adams")
+
+for (name in sumstat_names) {
+  df <- get(name)
+
+  df <- df %>%
+    rename(chr = V1, start = V2, end = V3, locus = V4) %>%
+    select(locus) %>%
+    mutate(!!paste0(name, "_locus") := locus)
+
+  quantanx_loci <- left_join(quantanx_loci, df, by = "locus")
+}
+
+strom_loci <- fread("Stromanxiety_GenomicRiskLoci.txt", data.table = F)
+li_loci <- fread("Lianxiety_GenomicRiskLoci.txt", data.table = F)
+friligkou_loci <- fread("Friligkouanxiety_GenomicRiskLoci.txt", data.table = F)
+adams_loci <- fread("AdamsMDD23andme_GenomicRiskLoci.txt", data.table = F)
+
+sumstats_list <- list(
+  strom_rsid = strom_loci,
+  li_rsid = li_loci,
+  friligkou_rsid = friligkou_loci,
+  adams_rsid = adams_loci
+)
+
+quantanx_loci <- reduce(names(sumstats_list), function(quantanx_loci, sumstats_name) {
+  sumstats_df <- sumstats_list[[sumstats_name]]
+  
+  quantanx_loci %>%
+    mutate(!!sumstats_name := pmap_chr(list(chr, start, end), ~ {
+      match_row <- sumstats_df %>%
+        filter(
+          chr == ..1 & (
+            (pos >= ..2 & pos <= ..3) |   # SNP within locus
+            (start <= ..3 & end >= ..2)   # reverse-matching where sumstats locus contains the quantanx region including any overlap, not just full containment
+          )
+        )
+      if (nrow(match_row) > 0) match_row$rsID[1] else NA_character_ # takes first match, check for multi matches though for replication flag not critical, or replace match_row$rsID[1] with paste(match_row$rsID, collapse = ";")
+    }))
+}, 
+.init = quantanx_loci)
+
+# Split into 4 pairwise files of our trait rsID and comparison rsID to check R2 in PLINK
+rep_cols <- c("strom_rsid", "li_rsid", "friligkou_rsid", "adams_rsid")
+
+snp_pairs_by_study <- quantanx_loci %>%
+  select(locus, rsID, all_of(rep_cols)) %>%
+  pivot_longer(cols = all_of(rep_cols), names_to = "study", values_to = "replication_rsid") %>%
+  separate_rows(replication_rsid, sep = ";", convert = TRUE) %>%
+  transmute(
+    study = str_remove(study, "_rsid"),
+    SNP_A = rsID,
+    SNP_B = replication_rsid
+  )
+
+snp_pairs_by_study %>%
+  group_by(study) %>%
+  group_split() %>%
+  walk(~ write_tsv(.x %>% select(SNP_A, SNP_B),
+                   file = paste0("compare_snp_pairs_", unique(.x$study), ".txt"),
+                   col_names = FALSE,
+                   na = ""))
+
+```
+
+```{bash}
+
+for f in compare_snp_pairs_*.txt; do
+  study=$(basename "$f" .txt | cut -d'_' -f4)
+  echo "Running LD for $study..."
+  while read -r a b; do
+    # skip lines where b is empty (no SNP for comparison study in same locus)
+    [ -z "$b" ] && continue
+    plink \
+      --bfile /users/k1756554/1kg_refpanels/g1000_eur \
+      --ld $a $b \
+      --out results_ld/${study}_${a}_${b}
+  done < "$f"
+done
+
+```
+
+
+```{r novelty flag}
+
+ld_files <- list.files(path = "results_ld", pattern = "\\.log$", full.names = TRUE)
+
+# define function to extract required information from log file
+read_ld_log <- function(file){
+  snps <- str_extract_all(basename(file), "rs[0-9]+")[[1]]
+  lines <- readLines(file)
+  r2_line <- lines[grepl("R-sq =", lines)]
+  if(length(r2_line) == 0) return(NULL)
+  r2 <- as.numeric(str_match(r2_line, "R-sq = ([0-9\\.eE+-]+)")[,2])
+  tibble(
+    SNP_A = snps[1],
+    SNP_B = snps[2],
+    R2 = r2
+  )
+}
+
+ld_table <- map_dfr(ld_files, read_ld_log)
+ld_table <- ld_table %>%
+  distinct(SNP_A, SNP_B, .keep_all = TRUE) 
+
+replication <- snp_pairs_by_study %>%
+  left_join(ld_table, by = c("SNP_A", "SNP_B")) %>%
+  mutate(replication_type = case_when(
+    SNP_A == SNP_B ~ "Exact replication",
+    !is.na(R2) & R2 >= 0.1 ~ "LD replication",
+    TRUE ~ "Novel" #i.e. R2 <0.1 is considered novel
+  ))
+         
+```
+
+# MAGMA 
+## Gene-based association test
+
+```{r}
+
+magma_genes <- fread("/FUMA_job686083/magma.genes.out.txt")
+magma_genes_sig <- magma_genes %>% 
+  filter(P < 2.506e-6) 
+nrow(magma_genes_sig)
+magma_genes_sig <- magma_genes_sig %>%
+  mutate(CHR = as.integer(CHR)) %>%
+  arrange(CHR, START)
+write.table(magma_genes_sig, "magma_genes_sig.txt", 
+              sep = "\t", 
+              row.names = FALSE, 
+              col.names = TRUE,
+              quote = FALSE)
+
+```
+
+Clump all GWAS variants to p = 1 (i.e. every variant gets put in a clump) with clump-range flag and a gene regions file in the format specified here - https://www.cog-genomics.org/plink/1.9/resources#genelist
+Contains one gene per row, with the following four columns:
+Chromosome code (example file shows 1, 2 etc. not chr1, chr2)
+Start of gene (base-pair units, 1-based)
+End of gene (this position is included in the interval)
+Gene ID
+```{bash}
+
+awk 'NR>1 {print $2, $3, $4, $10}' OFS='\t' magma_genes_sig.txt > magma_genes_sig_plinkformat.txt
+
+plink --bfile /1kg_bed/1KG_Phase3.WG.CLEANED.EUR_MAF001 \
+--clump quantanx_metaanalysis_filtered.gz \
+--clump-p1 1 \
+--clump-p2 1 \
+--clump-r2 0.1 \
+--clump-kb 500 \
+--clump-range magma_genes_sig_plinkformat.txt \
+--out quantanx_p1_rangemagma
+
+```
+
+```{r}
+
+gene_loci <- fread("quantanx_p1_rangemagma.clumped.ranges.txt", data.table = FALSE)
+
+# Genes appear in multiple clumps and need to identify where they multiple clumps share any member and merge together into one cluster. Can also look at POS to calculate this.
+
+library(igraph)
+
+gene_loci_sig <- gene_loci %>%
+  mutate(RANGES = if_else(RANGES == "[]", NA_character_, RANGES)) %>% #PLINK represents no overlapping range as "[]" rather than NA - convert to NA
+  filter(!is.na(RANGES)) %>%
+  mutate(RANGES = str_remove_all(RANGES, "[\\[\\]]") %>% str_trim()) %>%
+  filter(RANGES != "") %>%
+  separate_rows(RANGES, sep = ",") %>%
+  mutate(RANGES = str_trim(RANGES)) %>%
+  filter(RANGES %in% magma_genes_sig$SYMBOL)
+
+gene_edges <- gene_loci_sig %>%
+  group_by(SNP) %>%
+  filter(n() > 1) %>%          # only clumps with multiple sig genes
+  summarise(genes = list(RANGES)) %>%
+  mutate(edges = map(genes, ~ as.data.frame(t(combn(.x, 2))))) %>%
+  unnest(edges) %>%
+  rename(from = V1, to = V2)
+
+gene_edges <- gene_edges %>% distinct(from, to)
+g <- graph_from_data_frame(gene_edges, directed = FALSE)
+# Add isolated nodes (sig genes that never co-occur with another sig gene)
+isolated <- setdiff(magma_genes_sig$SYMBOL, V(g)$name)
+g <- add_vertices(g, length(isolated), name = isolated)
+
+components <- components(g)
+sig_genes_clustered <- tibble(GENE = names(components$membership),
+       cluster = components$membership) %>%
+  group_by(cluster) %>%
+  summarise(genes = list(sort(GENE)), n_genes = n())
+
+sig_genes_clustered <- sig_genes_clustered %>%
+  mutate(genes_str = map_chr(genes, ~ paste(.x, collapse = ", ")))
+
+sig_genes_clustered
+
+```
+
+## Gene sets and gene tissue
+```{r}
+
+gene_sets <- fread("FUMA_job686083/magma.gsa.out.txt")
+gene_sets <- gene_sets %>% 
+  filter(P < 0.0001) %>% 
+  arrange(P) %>%
+  mutate(bonf_sig = if_else(P < 2.94e-06, "Yes", "No"))
+
+gene_tissue_dev <- fread("FUMA_job686083/magma_exp_bs_dev_avg_log2RPKM.gsa.out.txt", skip = 4)
+gene_tissue_dev <- gene_tissue_dev %>% 
+  filter(P < 0.05/nrow(gene_tissue_dev)) %>%
+  arrange(P)
+
+gene_tissue_body <- fread("/FUMA_job686083/magma_exp_gtex_v8_ts_general_avg_log2TPM.gsa.out.txt", skip = 4)
+gene_tissue_body <- gene_tissue_body %>% 
+  filter(P < 0.05/nrow(gene_tissue_body)) %>%
+  arrange(P)
+gene_tissue_body
+
+```
+
+# LDSC rgs
+Genetic correlations with external traits
+```{bash}
+
+output_dir="/rg_ldsc"
+
+# My focal GWAS
+focal="/munged/quantanx_metaanalysis.sumstats.gz"
+
+# Sumstats location
+dir1="/externalrg/external_sumstats/munged"
+dir1_files=( #list trait names, example subset shown here
+ADHD06
+SCHI07
+SUBD01
+PPDP01
+SMOK07
+EXTE01
+AGAB02
+EXTR02
+CONS02
+OPEN02
+IBOS01
+ASTH02
+BODY16
+BIPO03
+AUTI09
+ANOR02
+EDUC03
+INCO01
+COAD03
+DIAB05
+)
+
+# Create a single comma-separated list of all external sumstats starting with focal phenotype
+all_sumstats="$focal"
+
+for f in "${dir1_files[@]}"; do
+    all_sumstats="${all_sumstats},${dir1}/${f}.sumstats.gz"
+done
+# check with echo "$all_sumstats"
+
+# If sumstats are in more than one location, list as above and add to all_sumstats
+# for f in "${dir2_files[@]}"; do
+#    all_sumstats="${all_sumstats},${dir2}/${f}.sumstats.gz"
+# done
+
+python /ldsc/ldsc.py \
+    --rg "$all_sumstats" \
+    --ref-ld-chr /ldsc/eur_w_ld_chr/ \
+    --w-ld-chr /ldsc/eur_w_ld_chr/ \
+    --out "${output_dir}/quant_anx_rg"
+
+```
+
+Extract results from log file
+```{bash}
+
+awk '/^p1/{found=1} found' quant_anx_rg.log | awk '{print $2, $3, $4, $6}' > rg_extracted.txt
+
+```

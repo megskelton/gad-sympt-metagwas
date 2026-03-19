@@ -1,0 +1,192 @@
+---
+title: "example_regenie_gwas_quantanx_metagwas"
+author: "Megan Skelton"
+output: html_document
+---
+
+# QC genotype file or create keep and extract lists to use in REGENIE script
+Restrict genotype file to analysis sample  
+Perform any necessary additional QC to your genotype file e.g. Minor allele frequency & Hardy-weinberg equilibrium  
+Check data format is suitable for REGENIE (MT format) - convert if not
+```{bash QC maf hwe}
+
+plink \
+-bfile ${gendat}nameofgeneticbfiles \
+--keep ${workdir}input/keep_ids.txt \
+--maf 0.01 \
+--hwe 0.000001 \
+--make-bed \
+--out ${gendat}nameofgeneticbfiles_quantanx_maf01_hwe6
+
+```
+
+# Regenie Step 1
+Create genomic predictions from whole genome regression model using genotyped data with each trait  
+https://rgcgithub.github.io/regenie/options/#genetic-data-file-format  
+
+Adjust covar column list as required for your sample (e.g. add array/chip, more PCs) and number of levels for categorical covariates
+If you have imputed file only, specify genotyped snps using --extract flag with a list of QCd genotyped snp ids  
+Running x-chr analysis separately with sex as an additional covariate
+```{bash regenie step 1}
+
+rm ${workdir}scripts/regenie_step1.sh
+cat <<'EOT'>> ${workdir}scripts/regenie_step1.sh
+#!/bin/bash -l
+#SBATCH --partition cpu
+#SBATCH --time=0-48:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=8
+#SBATCH --mem-per-cpu=19G
+#SBATCH --job-name=regenie_step1
+#SBATCH --output=/outputdir/regenie_step1_%j.out #replace with your output directory path
+
+gendat=$(sed '1q;d' paths.sh) #fragile - take care references correct path or hardcode absolute paths in the below
+workdir=$(sed '2q;d' paths.sh) 
+
+conda activate regenie_env
+
+regenie \
+--step 1 \
+--bed ${gendat}nameofgeneticbfiles_quantanx_maf01_hwe6 \
+--phenoFile ${workdir}input/quantanx_pheno.txt \
+--phenoColList latent_fs_std \
+--covarFile ${workdir}input/quantanx_covar.txt \
+--covarColList batch,PC{1:10} \
+--catCovarList batch \
+--maxCatLevels 3 \
+--bsize 1000 \
+--lowmem \
+--lowmem-prefix ${workdir}results/regenie_step1/tmp_reg1 \
+--out ${workdir}results/regenie_step1/quantanx_regenie_step1 \
+--threads 8 \
+--gz
+
+EOT
+
+sbatch ${workdir}scripts/regenie_step1.sh
+
+```
+   
+# Regenie Step 2
+
+Change from vcf as required. If using bed instead of vcf files the dose-field flag can be removed; bed files lose info on quality but should have been filtered previously e.g. INFO >0.3.
+This script assumes files are separated by chr, adapt if they are not (will not require array job).  
+Running x-chr analysis separately with sex as an additional covariate so only 1-22 here
+```{bash regenie step 2}
+
+rm ${workdir}scripts/regenie_step2.sh
+cat <<'EOT'>> ${workdir}scripts/regenie_step2.sh
+#!/bin/bash -l
+#SBATCH --partition cpu
+#SBATCH --time=0-48:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=8
+#SBATCH --mem-per-cpu=19G
+#SBATCH --job-name=regenie_step2
+#SBATCH --array=1-22
+#SBATCH --output=/outputdir/regenie_step2_%j.out #replace with your output directory path
+
+gendat=$(sed '1q;d' paths.sh) #fragile - take care references correct path or hardcode absolute paths in the below
+workdir=$(sed '2q;d' paths.sh) 
+
+CHR=${SLURM_ARRAY_TASK_ID}
+echo ${CHR} 
+
+conda activate regenie_env
+
+regenie \
+--step 2 \
+--vcf ${gendat}nameofgeneticbfiles_imputed_quantanx_chr${CHR}.vcf.gz \
+--dose-field DS \
+--extract ${gendat}QC/qcd_imp_var_list_chr${CHR}.txt \
+--phenoFile ${workdir}input/quantanx_pheno.txt \
+--phenoColList latent_fs_std \
+--covarFile ${workdir}input/quantanx_covar.txt \
+--covarColList batch,PC{1:10} \
+--catCovarList batch \
+--maxCatLevels 3 \
+--write-samples \
+--print-pheno \
+--bsize 400 \
+--pred ${workdir}results/regenie_step1/quantanx_regenie_step1_pred.list \
+--out ${workdir}results/regenie_step2/quantanx_regenie_step2_chr${CHR} \
+--threads 8 \
+--gz
+
+EOT
+
+sbatch ${workdir}scripts/regenie_step2.sh
+
+```
+
+To extect INFO scores from imputed vcfs for downstream steps
+```{bash}
+
+for CHR in {1..23}; do
+  bcftools query -f '%ID\t%INFO/INFO\n' \
+    ${gendat}nameofgeneticbfiles_imputed_quantanx_chr${CHR}.vcf.gz \
+    > ${workdir}input/info_scores_chr${CHR}.txt
+done
+
+```
+
+If x-chr output is named X as per MT format, rename/read in as 23 for the below script.
+Merge chr results.
+```{r merge chr output}
+
+source("paths.R")
+
+#ensure installed ("R.utils") so that data.table can read in gzipped files
+library(data.table)
+library(dplyr)
+
+pheno_name <- "gad_sympt_sev"
+n_chr <- 23 #or 22 if running autosomes only
+  
+# Read and combine all chromosomes
+chr_list <- lapply(1:n_chr, function(j) {
+  fread(paste0(workdir, "input/quantanx_regenie_step2_chr", j, "_", pheno_name, ".regenie.gz"), header = TRUE)
+})
+
+stopifnot("Expected 23 chromosome files" = length(chr_list) == n_chr)
+expected_rows <- sum(sapply(chr_list, nrow))
+
+merged <- rbindlist(chr_list)
+stopifnot("Row count mismatch after merge" = nrow(merged) == expected_rows)
+message("Done merging chromosomes. Total rows: ", nrow(merged))
+
+# Rename, transform P and MAF, and select columns
+merged <- merged %>%
+  rename(SNP = ID, 
+         CHR = CHROM,
+         POS = GENPOS,
+         EA = ALLELE1,
+         NEA = ALLELE0,
+         EAF = A1FREQ) %>%
+  mutate(P = 10^(-LOG10P),
+         MAF = if_else(EAF < 0.5, EAF, 1 - EAF)) %>%
+  select(SNP, CHR, POS, EA, NEA, BETA, SE, P, MAF, EAF, N)
+ 
+ stopifnot("P-values out of bounds" = min(merged$P, na.rm=TRUE) > 0 & max(merged$P, na.rm=TRUE) < 1)
+message("Done. Final row count: ", nrow(merged))
+print(head(merged))
+
+info <- lapply(1:23, function(j) {
+  fread(paste0(workdir, "input/info_scores_chr", j, ".txt"),
+        col.names = c("SNP", "INFO"))
+}) %>% rbindlist()
+
+# Replacing NAs with -999
+merged <- merged %>% 
+  left_join(info, by = "SNP") %>%
+  mutate(across(everything(), ~replace(., is.na(.), -999)))
+
+# save merged sumstats file
+write.table(merged, 
+              "results/quant_anx_GWAS.txt", 
+              sep = "\t", 
+              row.names = FALSE, 
+              col.names = TRUE,
+              quote = FALSE)
+
+```

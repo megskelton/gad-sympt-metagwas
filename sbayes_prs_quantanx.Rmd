@@ -1,0 +1,199 @@
+---
+title: "quantanx_PRS"
+output: html_document
+authors: "Rujia Wang & Megan Skelton"
+---
+
+https://github.com/zhilizheng/SBayesRC
+
+# Prepare summary statistics for SBayesRC
+Created by Tian Xie 2023/06/12
+```{r sbayesrc prep}
+
+library(data.table) 
+library(dplyr)
+#install.packages("https://github.com/zhilizheng/SBayesRC/releases/download/v0.2.6/SBayesRC_0.2.6.tar.gz", repos=NULL, type="source")
+
+## prepare your GWAS summary statistics to .ma file 1) using SNP ID from SBayesRC snp.info, 2) right format including 8 columns: SNP,A1,A2,freq,b,se,p,N  
+
+## read snp.info from SBayesRC which includes information of 7 millions SNPs used for PRS
+snp_info <- fread("/PRS/SBayesRC/ukbEUR_Imputed/snp.info")
+
+## read your GWAS summary statistics 
+GAD_summary <- fread("/meta_analysis/results/quantanx_sumstats.txt.gz")
+
+snp_info <- snp_info %>%
+  rename(SNP = ID,
+         CHR = Chrom,
+         BP = PhysPos) %>%
+  select(SNP, CHR, BP)
+
+GAD_summary <- GAD_summary %>%
+  rename(SNP_GAD = SNP,
+         b = BETA,
+         se = SE,
+         p = P,
+         freq = FREQ) %>%
+  mutate(A1 = toupper(A1),
+         A2 = toupper(A2)) %>%
+  select(SNP_GAD, CHR, BP, A1, A2, freq, b, se, p, N)
+
+mergedData <- GAD_summary %>%
+  left_join(snp_info, by=c("CHR","BP"))
+mergedData <- mergedData %>%
+  select(SNP, A1, A2, freq, b, se, p, N) %>%
+  filter(!is.na(SNP))
+
+fwrite(mergedData, "quantanx_cleaned_sumstats.ma", sep="\t")
+
+```
+
+# Generate SNP weights in SBayesRC
+Set variables
+```{bash set variables}
+
+ma_file="/PRS/SBayesRC/quantanx_cleaned_sumstats.ma" # GWAS summary in COJO format (the only input - change to your summary statistics)
+ld_folder="/PRS/SBayesRC/ukbEUR_Imputed"        # LD reference (downloaded from "Resources")
+annot="/PRS/SBayesRC/annot_baseline2.2.txt"     # Functional annotation (downloaded from "Resources")
+out_prefix="/PRS/SBayesRC/quantanx_PRS"   # Output prefix
+threads=8                       # Number of CPU cores
+
+```
+
+Generate new SNP weights
+```{bash snp weights}
+
+export OMP_NUM_THREADS=$threads
+
+# Tidy: optional step, tidy summary data
+## "log2file=TRUE" means the messages will be redirected to a log file 
+Rscript -e "SBayesRC::tidy(mafile='$ma_file', LDdir='$ld_folder', \
+                  output='${out_prefix}_tidy.ma', log2file=TRUE)"
+## Best practice: read the log to check issues in your GWAS summary data.  
+
+# Impute: optional step if your summary data doesn't cover the SNP panel
+Rscript -e "SBayesRC::impute(mafile='${out_prefix}_tidy.ma', LDdir='$ld_folder', \
+                  output='${out_prefix}_imp.ma', log2file=TRUE)"
+
+# SBayesRC: main function for SBayesRC
+Rscript -e "SBayesRC::sbayesrc(mafile='${out_prefix}_imp.ma', LDdir='$ld_folder', \
+                  outPrefix='${out_prefix}_sbrc', annot='$annot', log2file=TRUE)"
+
+```
+
+# Calculate PRS in PLINK
+Assumes output file is SNP ID col 1, EA col 2, Effect col 3 
+```{bash plink prs}
+
+plink \
+--bfile data_forSBayesRC_allChr \
+--keep gad_id_list.txt \
+--score ${out_prefix}_sbrc.txt 1 2 3 header sum center \
+--out ${out_prefix}
+
+```
+
+# PRS prediction
+Filter to required ancestry, ensure related individuals are removed
+
+## Anxiety symptom severity
+Using scale() such that coefficient and z-score represent a 1 SD increase in PRS.
+
+t-value output is labelled as z-score in the table (est/SE): For large samples, the t-distribution ≈ standard normal so can be interpreted as a z-score. glm output uses z-scores, so we are doing this for consistency - most PRS predict case-control binary outcomes
+```{r prs anx sympt sev}
+
+library(data.table)
+library(dplyr)
+library(pscl) # for pR2()
+
+dat <- readRDS("quantanx_prs.rds")
+prs <- fread("quantanx_PRS.profile")
+prs <- prs %>% 
+  select(FID, IID, quant_anxprs = SCORESUM)
+dat <- dat %>%
+  left_join(prs, by = c("FID", "IID")) %>%
+  filter(!is.na(quant_anxprs))
+
+mod0 <- lm(gad7_avg ~ Batch + Centre + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data = dat)
+
+mod1 <- lm(gad7_avg ~ Batch + Centre + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10 + scale(quant_anxprs), data = dat)
+
+summary(mod1)
+
+# Extract R2
+R2_mod0 <- summary(mod0)$r.squared
+R2_mod1 <- summary(mod1)$r.squared
+
+# Compute R2 specifically for PRS
+R2_PRS <- R2_mod1-R2_mod0
+print(paste("R2 for PRS:", R2_PRS))
+
+```
+
+## Anxiety case control
+### Liability conversion functions
+```{r r2 conversion function}
+
+#Lee SH, Goddard ME, Wray NR, Visscher PM. (2012) A better coefficient of determination for genetic profile analysis. Genet Epidemiol. 2012 Apr;36(3):214-24.
+  # K baseline disease risk
+  # r2 from a *linear regression model* attributable to genomic profile risk score
+  # P proportion of sample that are cases
+  # calculates proportion of variance explained on the liability scale
+
+h2l_R2 <- function(k, r2, p) {
+  x = qnorm(1-k)
+  z = dnorm(x)
+  i = z/k
+  C = k*(1-k)*k*(1-k)/(z^2*p*(1-p))
+  theta = i*((p-k)/(1-k))*(i*((p-k)/(1-k))-x)
+  h2l_R2 = C*r2 / (1 + C*theta*r2)
+}
+
+## uses the e adjustment to map Nagelkerke to the observed-scale component for ascertained case-control samples
+## So, you can use the binomial model, get Nagelkerke, and then convert using the code in functions.R
+## https://github.com/kn3in/ABC/blob/master/functions.R
+result_h2l <- function(k, r2n, p) {
+  x <- qnorm(1 - k)
+  z <- dnorm(x)
+  i <- z / k
+  cc <- k * (1 - k) * k * (1 - k) / (z^2 * p * (1 - p))
+  theta <- i * ((p - k)/(1 - k)) * (i * ((p - k) / ( 1 - k)) - x)
+  e <- 1 - p^(2 * p) * (1 - p)^(2 * (1 - p))
+  h2l <- cc * e * r2n / (1 + cc * e * theta * r2n)
+}
+
+```
+
+### Regressions
+```{r case control prediction}
+
+# using pcsl functions: can also use rcompanion package with nagelkerke(model)$Pseudo.R.squared.for.model.vs.null[3,]
+
+table(dat$anxiety_disorder, useNA = "always") # check case/control counts prior to regressions
+
+mod0_glm <- glm(anxiety_disorder ~ Batch + Centre + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, family = "binomial", data = dat)
+
+mod1_glm <- glm(anxiety_disorder ~ Batch + Centre + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10 + scale(quant_anxprs), family = "binomial", data = dat)
+
+summary(mod1_glm)
+
+# Extract R2
+pR0 <- pR2(mod0_glm)["r2CU"]
+pR1 <- pR2(mod1_glm)["r2CU"]
+delta_nagelkerke <- as.numeric(pR1 - pR0)
+print(paste("Observed R2 for PRS:", delta_nagelkerke))
+
+Liab_R2 <- result_h2l(0.2, delta_nagelkerke, mean(dat$anxiety_disorder))  # assuming 20% prevalence of anxiety disorder
+Liab_R2
+
+## compare to conversion method using lm;fit linear regressions with 0/1 outcome. Should be the ~same
+mod0_lm <- lm(anxiety_disorder ~ Batch + Centre + PC1 + PC2 + PC3 + PC4 +
+              PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data = dat)
+mod1_lm <- lm(anxiety_disorder ~ Batch + Centre + PC1 + PC2 + PC3 + PC4 +
+              PC5 + PC6 + PC7 + PC8 + PC9 + PC10 + scale(quant_anxprs),
+              data = dat)
+r2_obs <- summary(mod1_lm)$r.squared - summary(mod0_lm)$r.squared
+h2_liability_from_lm <- h2l_R2(0.2, r2_obs, mean(dat$anxiety_disorder))
+h2_liability_from_lm
+
+```

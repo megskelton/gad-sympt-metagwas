@@ -1,0 +1,134 @@
+---
+title: "mtcojo"
+output: html_document
+author: "Megan Skelton"
+---
+
+GWAS summary data  
+Columns are SNP, the effect allele, the other allele, frequency of the effect allele, effect size, standard error, p-value and sample size.
+
+```{bash}
+
+# Example reformatting for a file structured: SNP MARKERID CHR BP A1 A2 FREQ BETA SE P N with lowercase alleles
+zcat /meta_analysis/results/quantanx_sumstats.txt.gz | \
+awk 'NR==1 {print "SNP","A1","A2","freq","b","se","p","N"; next} \
+     {print $1, toupper($5), toupper($6), $7, $8, $9, $10, $11}' OFS="\t" | \
+gzip > /mtcojo/quantanx_mtcojoformat.gz
+
+```
+
+List of files for mtcojo
+```{bash}
+
+# create a file quantanx_dep_neur_anx_mtcojo.list e.g. using vim, consisting of the following lines:
+dimanx /mtcojo/quantanx_mtcojoformat.gz
+neur /mtcojo/neuro_mtcojoformat.gz
+depr_sympt /mtcojo/deprsympt_mtcojoformat.gz
+depr /mtcojo/mdd_mtcojoformat.gz
+anx /mtcojo/pgcanx_mtcojoformat.gz
+
+```
+
+```{bash}
+
+/gcta-1.94.1 \
+--bfile /genotyped/nameofgeneticbfiles_quantanx_maf01_hwe6 \
+--mtcojo-file /mtcojo/quantanx_dep_neur_anx_mtcojo.list \
+--ref-ld-chr /ldsc/eur_w_ld_chr/ \
+--w-ld-chr /ldsc/eur_w_ld_chr/ \
+--out /mtcojo/mtcojo_results
+
+```
+
+Run separately for sufficiently powered traits - list file contains one trait only
+```{bash}
+
+/gcta-1.94.1 \
+--bfile /genotyped/nameofgeneticbfiles_quantanx_maf01_hwe6 \
+--mtcojo-file /mtcojo/quantanx_neur_mtcojo.list \
+--ref-ld-chr /ldsc/eur_w_ld_chr/ \
+--w-ld-chr /ldsc/eur_w_ld_chr/ \
+--out /mtcojo/mtcojo_neur_results
+
+```
+
+Extract summary information
+```{bash}
+
+# g-w sig snps when conditioned on neuroticism
+awk 'NR>1 && $11 < 5e-8 {print $0}' mtcojo_neur_results.mtcojo.cma | wc -l
+
+awk 'NR==1 || $11 < 5e-8' mtcojo_neur_results.mtcojo.cma > mtcojo_neur_sig.cma
+awk 'NR==FNR {sig[$1]=1; next} 
+     ($1 in sig) {print $1, $2, $3, $4}' \
+  mtcojo_neur_sig.cma <(zcat /meta_analysis/results/quantanx_sumstats.txt.gz) \
+  > gwsig_condneur_positions.txt
+  
+awk 'BEGIN{OFS="\t"}
+     NR==FNR {pos[$1]=$2"\t"$3"\t"$4; next}
+     FNR==1 {print "SNP","MARKERID","CHR","BP",$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12; next}
+     ($1 in pos) {print $1,pos[$1],$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12}' \
+  gwsig_condneur_positions.txt mtcojo_neur_sig.cma \
+  > mtcojo_neur_sig_withpos.cma
+
+# attenutation
+awk 'NR>1 && $5!="" && $9!="" && $5!="NA" && $9!="NA" {
+      b = ($5 < 0 ? -$5 : $5);
+      bc = ($9 < 0 ? -$9 : $9);
+      if (b>0) { t++; if (bc < b) c++ }
+    }
+    END {
+      if (t==0) print "No valid rows";
+      else printf "attenuated: %d out of %d (%.2f%%)\n", c, t, c/t*100
+    }' mtcojo_neur_results.mtcojo.cma
+
+# sign flips
+awk 'NR>1 && $5!="" && $9!="" && $5!="NA" && $9!="NA" {
+      b = $5+0; bc = $9+0;
+      sb = (b>0?1:(b<0?-1:0));
+      sbc = (bc>0?1:(bc<0?-1:0));
+      if (sb!=0 && sbc!=0) { total++; if (sb!=sbc) flips++ }
+    }
+    END {
+      if (total==0) print "No valid sign rows";
+      else printf "sign flips: %d/%d (%.2f%%)\n", flips, total, flips/total*100
+    }' mtcojo_neur_results.mtcojo.cma
+
+# mean SE ratio
+awk 'NR>1 && $6!="" && $10!="" && $6!="NA" && $10!="NA" && $6!=0 {
+      r = $10/$6; sum+=r; n++;
+      if (n==1 || r<min) min=r;
+      if (r>max) max=r
+    }
+    END {
+      if (n==0) print "No valid SE rows";
+      else printf "mean se ratio (bC_se / se): %.3f (min=%.3f max=%.3f n=%d)\n", sum/n, min, max, n
+    }' mtcojo_neur_results.mtcojo.cma
+    
+```
+
+# LDSC h2 of conditioned sumstats
+```{bash neur check column headers munge h2}
+
+awk 'BEGIN{OFS="\t"} {print $1,$2,$3,$4,$8,$9,$10,$11}' mtcojo_neur_results.mtcojo.cma > mtcojo_neur_formunging #extract required columns
+
+/users/k1756554/ldsc/munge_sumstats.py \
+--chunksize 50000 \
+--snp SNP \
+--p bC_pval \
+--a1 A1 \
+--a2 A2 \
+--frq freq \
+--signed-sumstats bC,0 \
+--sumstats /mtcojo/mtcojo_neur_formunging \
+--out /mtcojo/mtcojo_neur_munged \
+--merge-alleles /ldsc/w_hm3.snplist
+
+python /ldsc/ldsc.py \
+--h2 /mtcojo/mtcojo_neur_munged.sumstats.gz \
+--ref-ld-chr /ldsc/eur_w_ld_chr/ \
+--w-ld-chr /ldsc/eur_w_ld_chr/ \
+--out /mtcojo/mtcojo_neur_h2
+
+```
+

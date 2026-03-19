@@ -1,0 +1,85 @@
+---
+title: "Extract latent factor scores for continuous measures of anxiety"
+author: "Genevieve Morneau-Vaillancourt"
+output: html_document
+---
+
+Load packages (install packages first by removing '#' if needed)
+```{r}
+# install.packages('lavaan')
+library(lavaan)
+
+# install.packages('tidyverse')
+library(tidyverse)
+
+#install.packages('psych')
+library(psych)
+```
+
+Read your data
+Different extensions can be read, for example .txt; .sav; .xlsx
+Some extensions including .sav will necessitate packages such as haven or foreign
+For more information, see tutorials such as: https://www.datafiles.samhsa.gov/get-help/format-specific-issues/how-do-i-read-data-r
+```{r}
+# line of code to upload your data e.g. datafile <- read_delim("filename.txt")
+```
+
+Run lavaan model including ≥3 time points using maximum likelihood for missing data, assuming no correlations between residuals.
+Note: Replace var1, var2, var3 with the names of your variables and add additional variables if you have more than 3 time points. Replace datafile with the label for your uploaded datafile
+The default name of the factor score variable in the model below is "latent_factor" 
+```{r}
+# Create model to estimate a latent factor 
+model <- '
+latent_factor =~ var1 + var2 + var3
+'
+
+# Fit model
+fitmodel <- sem(model, missing = "FIML", estimator = "ML", data = datafile)
+summary(fitmodel)
+
+# Save coefficients
+factor_scores <- predict(fitmodel)
+```
+
+Extract latent factor scores
+```{r}
+# Create and fit a new model including ID variables - this step is to be able to merge extracted latent factor scores with ID variables. Please ignore warning messages after fitting the model as model fit is irrelevant here; it's a hack to get the IDs in the lavaan internal data matrix.
+model_id <- '
+participant_id ~~ var1 + var2 + var3
+'
+fitmodel_id <- sem(model_id, missing = "FIML", estimator = "ML", data = datafile)
+
+# Create a new dataset including the saved factor scores. Confirm that the id variable is the first column in the internal data matrix e.g. colnames(fitmodel_id@Data@X[[1]])
+datafile2 <- fitmodel_id@Data@X[[1]]
+
+# Merge datasets including estimated factor scores and ID variables
+datafile3 <- data.frame(factor_scores, participant_id = datafile2[,1])
+```
+
+Merge with original datafile
+```{r}
+datafile_final <- merge(datafile, datafile3, by = c("participant_id"), all.x = TRUE)
+```
+
+Descriptives of latent factor score using e.g. psych package or base r functions
+```{r latent score descriptives}
+psych::describe(datafile_final$latent_factor)
+```
+
+Standardise latent factor score
+```{r stdise latent factor}
+datafile_final <- datafile_final %>%
+  mutate(latent_fs_std = as.numeric(scale(latent_factor)))
+
+psych::describe(datafile_final$latent_fs_std)
+```
+
+You can then save this new datafile and perform the GWAS on "latent_fs_std".
+```{r}
+# code to save your datafile
+datafile_final <- datafile_final %>%
+  mutate(FID = participant_id, IID = participant_id)
+
+write_tsv(datafile_final %>% select(FID, IID, latent_fs_std), 
+          "quantanx_pheno.txt")
+```
